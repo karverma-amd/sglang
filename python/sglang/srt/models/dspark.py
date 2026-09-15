@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Callable, Iterable, Optional, Tuple
 
 import torch
@@ -28,6 +29,45 @@ from sglang.srt.speculative.ragged_verify import (
 
 logger = logging.getLogger(__name__)
 
+# --- experimental: fp8 target lm_head GEMM for the DSPARK verify logits ------
+# Gated by SGLANG_DSPARK_FP8_LM_HEAD=1. The bf16 head matmul
+# [num_verify_tokens, hidden] x [hidden, vocab_slice] is a per-step decode cost;
+# running it in fp8 (per-token act scale + per-output-channel weight scale)
+# roughly halves it. Weight fp8 is quantized once and cached on the module.
+_DSPARK_FP8_LM_HEAD = os.environ.get("SGLANG_DSPARK_FP8_LM_HEAD", "0") == "1"
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = 448.0
+
+
+def _fp8_quant_per_row(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row (dim=-1) symmetric fp8 quant. Returns (fp8 tensor, float32 scale [rows,1])."""
+    amax = x.abs().amax(dim=-1, keepdim=True).to(torch.float32).clamp_(min=1e-6)
+    scale = amax / _FP8_MAX
+    x_fp8 = (x.to(torch.float32) / scale).clamp_(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return x_fp8, scale
+
+
+def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """logits = hidden @ weight.T computed in fp8 via torch._scaled_mm."""
+    weight = lm_head.weight  # [N(vocab_slice), K(hidden)]
+    w_fp8 = getattr(lm_head, "_fp8_weight_cache", None)
+    w_scale = getattr(lm_head, "_fp8_wscale_cache", None)
+    if w_fp8 is None or w_fp8.shape != weight.shape:
+        w_fp8, w_scale = _fp8_quant_per_row(weight)  # [N,K], [N,1]
+        lm_head._fp8_weight_cache = w_fp8
+        lm_head._fp8_wscale_cache = w_scale
+    h_fp8, h_scale = _fp8_quant_per_row(hidden)  # [M,K], [M,1]
+    # a=[M,K] fp8, b=[K,N] fp8 (col-major via .t()); scale_a per-row [M,1],
+    # scale_b per-col [1,N]. Output cast back to hidden dtype.
+    return torch._scaled_mm(
+        h_fp8,
+        w_fp8.t(),
+        scale_a=h_scale,
+        scale_b=w_scale.t(),
+        out_dtype=hidden.dtype,
+    )
+
+
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
 
 
@@ -45,6 +85,13 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
+    if (
+        _DSPARK_FP8_LM_HEAD
+        and weight.is_floating_point()
+        and hidden.shape[0] > 0
+        and weight.shape[-1] % 16 == 0
+    ):
+        return _fp8_lm_head_matmul(hidden, lm_head)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
